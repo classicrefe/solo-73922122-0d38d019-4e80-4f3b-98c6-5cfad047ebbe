@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from . import config, db, processing
 from .worker import JobWorker, new_instance_id
@@ -29,6 +30,15 @@ _LANE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SAMPLE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BASE_RE = re.compile(r"^[ACGT]{%d}$" % config.BARCODE_LEN)
 _RESERVED_PREFIX = "__"
+_MAX_REASON = 2000
+
+
+class WithdrawRequest(BaseModel):
+    reason: str = Field(
+        ..., min_length=1, max_length=_MAX_REASON,
+        description="Why the lane is withdrawn (mandatory; kept with the "
+                    "original publish record for traceability).",
+    )
 
 
 def _validate_barcodes(raw: str) -> list[dict[str, str]]:
@@ -135,7 +145,11 @@ app = FastAPI(
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically. A published lane can be withdrawn "
+        "with a reason: its files, counts and publish record are retained for "
+        "traceability, new direct and snapshot-scoped downloads are rejected, "
+        "old snapshots keep their manifest but become invalid, and new "
+        "snapshots only include available lanes."
     ),
     lifespan=lifespan,
 )
@@ -265,6 +279,15 @@ def retry_job(job_id: str):
 
 # ---------------- published lanes ----------------
 
+def _withdrawal_info(row) -> dict[str, Any] | None:
+    if row["withdrawal_reason"] is None:
+        return None
+    return {
+        "reason": row["withdrawal_reason"],
+        "withdrawn_at": row["withdrawn_at"],
+    }
+
+
 @app.get("/lanes")
 def list_lanes():
     return [
@@ -273,9 +296,34 @@ def list_lanes():
             "job_id": r["job_id"],
             "published_at": r["published_at"],
             "seq": r["seq"],
+            "withdrawn": r["withdrawal_reason"] is not None,
+            "withdrawal": _withdrawal_info(r),
         }
         for r in db.published_lanes()
     ]
+
+
+@app.post("/lanes/{lane}/withdraw", status_code=200,
+          tags=["withdrawal"])
+def withdraw_lane(lane: str, body: WithdrawRequest):
+    """Withdraw a published lane and record the reason.
+
+    The original paired files, count table and publish record are retained
+    for traceability; only a withdrawal marker is added. Afterwards new
+    direct downloads of the lane and any snapshot containing it are rejected
+    as a whole, and new snapshots exclude the lane. Repeating the withdrawal
+    does not change the original reason (the response carries
+    ``already_withdrawn``).
+    """
+    if not _LANE_RE.match(lane or ""):
+        raise HTTPException(400, "lane must match [A-Za-z0-9_.-]{1,64}")
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(400, "reason must not be empty")
+    result = db.withdraw_lane(lane, reason, app.state.instance_id)
+    if result is None:
+        raise HTTPException(404, "lane not published (or unknown)")
+    return result
 
 
 @app.get("/lanes/{lane}")
@@ -286,18 +334,34 @@ def get_lane(lane: str):
         raise HTTPException(404, "lane not published (or unknown)")
     counts = [dict(r) for r in db.lane_counts(lane)]
     total = sum(c["read_pairs"] for c in counts)
+    withdrawal = db.get_withdrawal(lane)
     return {
         "lane": lane,
         "job_id": pub["job_id"],
         "published_at": pub["published_at"],
         "total_read_pairs": total,
         "counts": counts,
+        "withdrawn": withdrawal is not None,
+        "withdrawal": (
+            None if withdrawal is None
+            else {"reason": withdrawal["reason"],
+                  "withdrawn_at": withdrawal["withdrawn_at"]}
+        ),
     }
 
 
 def _bucket_file(lane: str, bucket: str, mate: str) -> Path:
     if mate not in ("r1", "r2"):
         raise HTTPException(400, "mate must be r1 or r2")
+    # Withdrawal is checked before touching any file: a request that starts
+    # after the withdrawal is rejected as a whole rather than silently
+    # skipping the lane. A response that already started streaming (open file
+    # handle held by FileResponse) is unaffected and can finish completely.
+    if db.get_withdrawal(lane) is not None:
+        raise HTTPException(
+            409,
+            f"lane {lane} has been withdrawn; new downloads are refused "
+            "(original data retained for traceability)")
     row = db.get_conn().execute(
         "SELECT * FROM lane_counts WHERE lane=? AND sample_id=?",
         (lane, bucket)).fetchone()
@@ -326,8 +390,10 @@ def download_quarantine(lane: str, mate: str):
 
 @app.post("/snapshots", status_code=201)
 def create_snapshot():
-    lanes = [r["lane"] for r in db.published_lanes()]
-    return db.create_snapshot(uuid.uuid4().hex, lanes)
+    # Only available (published, non-withdrawn) lanes are eligible; the
+    # snapshot transaction takes the SQLite write lock up front so a
+    # concurrent withdrawal is strictly ordered against it.
+    return db.create_snapshot(uuid.uuid4().hex)
 
 
 @app.get("/snapshots")
@@ -343,12 +409,29 @@ def get_snapshot(snapshot_id: str):
     return snap
 
 
-def _snapshot_bucket_files(snapshot_id: str, sample_id: str, mate: str):
-    if mate not in ("r1", "r2"):
-        raise HTTPException(400, "mate must be r1 or r2")
+def _require_valid_snapshot(snapshot_id: str) -> dict[str, Any]:
+    """Return the snapshot or raise. Invalid snapshots fail the whole call.
+
+    The stored manifest is left untouched; when one of its lanes has since
+    been withdrawn, every sample/quarantine download through the snapshot is
+    rejected outright instead of silently dropping that lane's data.
+    """
     snap = db.get_snapshot(snapshot_id)
     if snap is None:
         raise HTTPException(404, "snapshot not found")
+    if not snap["valid"]:
+        raise HTTPException(
+            409,
+            "snapshot is invalid because its lane(s) "
+            f"{snap['withdrawn_lanes']} have been withdrawn; the whole "
+            "download is refused (the original manifest is retained)",
+        )
+    return snap
+
+
+def _snapshot_bucket_files(snap: dict[str, Any], sample_id: str, mate: str):
+    if mate not in ("r1", "r2"):
+        raise HTTPException(400, "mate must be r1 or r2")
     files: list[Path] = []
     conn = db.get_conn()
     for lane in snap["lanes"]:
@@ -358,7 +441,7 @@ def _snapshot_bucket_files(snapshot_id: str, sample_id: str, mate: str):
         if row is None:
             continue  # sample absent from this lane's table
         files.append(_safe_published_path(row[f"{mate}_file"]))
-    return snap, files
+    return files
 
 
 def _iter_concat(files: list[Path]):
@@ -374,7 +457,8 @@ def _iter_concat(files: list[Path]):
 
 @app.get("/snapshots/{snapshot_id}/samples/{sample_id}/{mate}")
 def snapshot_sample(snapshot_id: str, sample_id: str, mate: str):
-    snap, files = _snapshot_bucket_files(snapshot_id, sample_id, mate)
+    snap = _require_valid_snapshot(snapshot_id)
+    files = _snapshot_bucket_files(snap, sample_id, mate)
     if not files:
         raise HTTPException(404, f"sample {sample_id!r} absent from snapshot")
     headers = {"X-Snapshot-Lanes": ",".join(snap["lanes"])}
@@ -387,8 +471,9 @@ def snapshot_sample(snapshot_id: str, sample_id: str, mate: str):
 
 @app.get("/snapshots/{snapshot_id}/quarantine/{mate}")
 def snapshot_quarantine(snapshot_id: str, mate: str):
-    snap, files = _snapshot_bucket_files(
-        snapshot_id, processing.QUARANTINE, mate)
+    snap = _require_valid_snapshot(snapshot_id)
+    files = _snapshot_bucket_files(
+        snap, processing.QUARANTINE, mate)
     if not files:
         raise HTTPException(404, "quarantine bucket absent from snapshot")
     headers = {"X-Snapshot-Lanes": ",".join(snap["lanes"])}

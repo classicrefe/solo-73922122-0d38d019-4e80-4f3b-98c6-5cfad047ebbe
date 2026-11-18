@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS lane_publishes (
     seq             INTEGER NOT NULL UNIQUE
 );
 
+-- Withdrawal never deletes a publish/count row: the original paired files,
+-- counts and publish record stay in place for traceability. This table only
+-- marks the lane as withdrawn, once, with the operator-supplied reason.
+CREATE TABLE IF NOT EXISTS lane_withdrawals (
+    lane          TEXT PRIMARY KEY REFERENCES lane_publishes(lane),
+    reason        TEXT NOT NULL,
+    withdrawn_at  TEXT NOT NULL,
+    instance_id   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS lane_counts (
     lane        TEXT NOT NULL REFERENCES lane_publishes(lane),
     sample_id   TEXT NOT NULL,           -- '' denotes the quarantine bucket
@@ -235,8 +245,63 @@ def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]]) -> None:
 # ---------- published lanes / snapshots ----------
 
 def published_lanes() -> list[sqlite3.Row]:
+    """All publish rows, including withdrawn ones, in publish order.
+
+    Withdrawal metadata is joined on so callers can filter or display the
+    withdrawn state; the original publish/count rows are never removed.
+    """
     return get_conn().execute(
-        "SELECT * FROM lane_publishes ORDER BY seq").fetchall()
+        """SELECT p.*, w.reason AS withdrawal_reason,
+                  w.withdrawn_at AS withdrawn_at
+           FROM lane_publishes p
+           LEFT JOIN lane_withdrawals w ON w.lane = p.lane
+           ORDER BY p.seq""").fetchall()
+
+
+def get_withdrawal(lane: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM lane_withdrawals WHERE lane=?", (lane,)).fetchone()
+
+
+def withdraw_lane(lane: str, reason: str, instance_id: str | None) -> dict[str, Any] | None:
+    """Mark a published lane withdrawn inside one immediate transaction.
+
+    Returns the withdrawal record (with ``already_withdrawn`` set when the
+    lane was already withdrawn, in which case the original reason is kept
+    verbatim), or None when the lane was never published. Because both this
+    write and snapshot creation take a write lock up front, a snapshot
+    committed after the withdrawal can never include this lane, and a
+    snapshot that committed first is frozen without it being retroactively
+    changed.
+    """
+    now = _now()
+    with tx() as conn:
+        pub = conn.execute(
+            "SELECT lane FROM lane_publishes WHERE lane=?", (lane,)).fetchone()
+        if pub is None:
+            return None
+        existing = conn.execute(
+            "SELECT * FROM lane_withdrawals WHERE lane=?", (lane,)).fetchone()
+        if existing is not None:
+            return {
+                "lane": lane,
+                "reason": existing["reason"],
+                "withdrawn_at": existing["withdrawn_at"],
+                "instance_id": existing["instance_id"],
+                "already_withdrawn": True,
+            }
+        conn.execute(
+            """INSERT INTO lane_withdrawals (lane, reason, withdrawn_at, instance_id)
+               VALUES (?,?,?,?)""",
+            (lane, reason, now, instance_id),
+        )
+    return {
+        "lane": lane,
+        "reason": reason,
+        "withdrawn_at": now,
+        "instance_id": instance_id,
+        "already_withdrawn": False,
+    }
 
 
 def lane_counts(lane: str) -> list[sqlite3.Row]:
@@ -245,14 +310,22 @@ def lane_counts(lane: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def create_snapshot(snapshot_id: str, lanes: list[str]) -> dict[str, Any]:
+def create_snapshot(snapshot_id: str) -> dict[str, Any]:
+    """Freeze the currently available (published, non-withdrawn) lanes.
+
+    Runs in a single ``BEGIN IMMEDIATE`` transaction, so the lane set is read
+    while holding the write lock: a withdrawal committed before this
+    transaction excludes its lane, and any withdrawal racing this call blocks
+    until commit and therefore takes effect afterwards without changing this
+    snapshot's fixed list.
+    """
     now = _now()
     with tx() as conn:
         rows = conn.execute(
-            "SELECT lane, seq FROM lane_publishes WHERE lane IN (%s) ORDER BY seq"
-            % ",".join("?" * len(lanes)),
-            lanes,
-        ).fetchall()
+            """SELECT p.lane, p.seq FROM lane_publishes p
+               LEFT JOIN lane_withdrawals w ON w.lane = p.lane
+               WHERE w.lane IS NULL
+               ORDER BY p.seq""").fetchall()
         fixed = [r["lane"] for r in rows]
         conn.execute(
             "INSERT INTO snapshots (snapshot_id, created_at, lanes_json) VALUES (?,?,?)",
@@ -262,7 +335,34 @@ def create_snapshot(snapshot_id: str, lanes: list[str]) -> dict[str, Any]:
             "INSERT INTO snapshot_lanes (snapshot_id, lane, seq) VALUES (?,?,?)",
             [(snapshot_id, r["lane"], r["seq"]) for r in rows],
         )
-    return {"snapshot_id": snapshot_id, "created_at": now, "lanes": fixed}
+    return _snapshot_view(snapshot_id, now, fixed)
+
+
+def _withdrawn_lanes(conn: sqlite3.Connection, lanes: list[str]) -> list[sqlite3.Row]:
+    if not lanes:
+        return []
+    return conn.execute(
+        "SELECT lane, reason, withdrawn_at FROM lane_withdrawals "
+        "WHERE lane IN (%s) ORDER BY withdrawn_at"
+        % ",".join("?" * len(lanes)),
+        lanes,
+    ).fetchall()
+
+
+def _snapshot_view(snapshot_id: str, created_at: str, lanes: list[str],
+                   conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    if conn is None:
+        conn = get_conn()
+    withdrawn = [dict(r) for r in _withdrawn_lanes(conn, lanes)]
+    view = {
+        "snapshot_id": snapshot_id,
+        "created_at": created_at,
+        "lanes": lanes,
+        "withdrawn_lanes": [w["lane"] for w in withdrawn],
+        "withdrawals": withdrawn,
+        "valid": not withdrawn,
+    }
+    return view
 
 
 def get_snapshot(snapshot_id: str) -> dict[str, Any] | None:
@@ -271,20 +371,19 @@ def get_snapshot(snapshot_id: str) -> dict[str, Any] | None:
     ).fetchone()
     if row is None:
         return None
-    return {
-        "snapshot_id": row["snapshot_id"],
-        "created_at": row["created_at"],
-        "lanes": json.loads(row["lanes_json"]),
-    }
+    lanes = json.loads(row["lanes_json"])
+    # The stored list is never rewritten: a snapshot keeps its original
+    # manifest; withdrawal only flags the snapshot invalid.
+    return _snapshot_view(
+        snapshot_id, row["created_at"], lanes, conn=get_conn())
 
 
 def list_snapshots() -> list[dict[str, Any]]:
+    conn = get_conn()
     return [
-        {
-            "snapshot_id": r["snapshot_id"],
-            "created_at": r["created_at"],
-            "lanes": json.loads(r["lanes_json"]),
-        }
-        for r in get_conn().execute(
+        _snapshot_view(
+            r["snapshot_id"], r["created_at"], json.loads(r["lanes_json"]),
+            conn=conn)
+        for r in conn.execute(
             "SELECT * FROM snapshots ORDER BY created_at").fetchall()
     ]

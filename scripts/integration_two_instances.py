@@ -7,7 +7,11 @@ Simulates the docker-compose deployment:
     and query/download stay responsive;
   * jobs are claimed by exactly one instance each and work is shared;
   * duplicate submissions reuse the task, conflicting input is rejected;
-  * snapshots fix the published lane set.
+  * snapshots fix the published lane set;
+  * lane withdrawal is enforced from both instances: direct and snapshot
+    downloads are refused, old snapshots are flagged invalid as a whole,
+    new snapshots exclude withdrawn lanes and repeat withdrawals keep the
+    original reason.
 
 Hard-crash recovery (SIGKILL mid-lane) is covered by the pytest suite
 (tests/test_failure_and_recovery.py) because some sandboxes forbid kill().
@@ -213,7 +217,66 @@ def main() -> int:
         assert set(json.loads(snap2)["lanes"]) == before
         print(f"    snapshot keeps {len(before)} lanes; later lane excluded")
 
-        print("[5] duplicate lane reuses task; different input rejected (409)")
+        print("[5] lane withdrawal across instances")
+        # Withdraw via instance B; the marker is on the shared volume/DB so
+        # instance A enforces it as well.
+        code, wd = http("POST", f"{BASE_B}/lanes/laneIT0/withdraw",
+                        data=json.dumps({"reason": "contaminated reads"}).encode())
+        assert code == 200, (code, wd)
+        wd_row = json.loads(wd)
+        assert wd_row["already_withdrawn"] is False
+        assert wd_row["reason"] == "contaminated reads"
+
+        # Repeating the withdrawal keeps the original reason verbatim.
+        code, wd_again = http("POST", f"{BASE_A}/lanes/laneIT0/withdraw",
+                              data=json.dumps({"reason": "new reason"}).encode())
+        again = json.loads(wd_again)
+        assert code == 200 and again["already_withdrawn"] is True
+        assert again["reason"] == "contaminated reads"
+
+        # Unknown lane cannot be withdrawn.
+        code, _ = http("POST", f"{BASE_A}/lanes/ghostLane/withdraw",
+                       data=json.dumps({"reason": "x"}).encode())
+        assert code == 404
+
+        # Original files, counts and publish record remain for traceability.
+        code, detail = http("GET", f"{BASE_A}/lanes/laneIT0")
+        assert code == 200
+        detail_row = json.loads(detail)
+        assert detail_row["withdrawn"] is True
+        assert detail_row["withdrawal"]["reason"] == "contaminated reads"
+        assert detail_row["total_read_pairs"] > 0
+
+        # New direct downloads refused on BOTH instances, every bucket/mate.
+        for base in (BASE_A, BASE_B):
+            for path in ("/lanes/laneIT0/samples/sampleA/r1",
+                         "/lanes/laneIT0/samples/sampleB/r2",
+                         "/lanes/laneIT0/quarantine/r1",
+                         "/lanes/laneIT0/quarantine/r2"):
+                code, _ = http("GET", base + path)
+                assert code == 409, (base, path, code)
+
+        # Old snapshot keeps its manifest but is invalid and refuses whole.
+        code, old_snap = http("GET", f"{BASE_A}/snapshots/{snap_id}")
+        old = json.loads(old_snap)
+        assert old["valid"] is False
+        assert "laneIT0" in old["lanes"]
+        assert "laneIT0" in old["withdrawn_lanes"]
+        code, body = http(
+            "GET", f"{BASE_A}/snapshots/{snap_id}/quarantine/r1")
+        assert code == 409
+
+        # New snapshots only contain available lanes; other lanes keep
+        # serving downloads and new lanes keep being processed.
+        code, fresh = http("POST", f"{BASE_A}/snapshots")
+        fresh_row = json.loads(fresh)
+        assert fresh_row["valid"] is True
+        assert "laneIT0" not in fresh_row["lanes"]
+        assert "laneIT1" in fresh_row["lanes"]
+        code, body = http("GET", f"{BASE_B}/lanes/laneIT1/samples/sampleA/r1")
+        assert code == 200 and len(body) > 0
+
+        print("[6] duplicate lane reuses task; different input rejected (409)")
         boundary, body = multipart("laneIT0", barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 201 and json.loads(resp)["reused"] is True
@@ -225,12 +288,12 @@ def main() -> int:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[7] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[7] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)

@@ -27,6 +27,14 @@ volume** with a **128 MiB memory limit**.
 * Snapshots freeze the published lane list at creation time. Sample/
   quarantine downloads through a snapshot only ever concatenate files from
   that fixed list — lanes published later never mix in.
+* A published lane can be **withdrawn with a reason**
+  (`POST /lanes/{lane}/withdraw`) when its reads are found contaminated:
+  the original paired files, count table and publish record are retained for
+  traceability, while every new direct download of the lane is refused with
+  `409`. Old snapshots keep their original manifest but are flagged
+  `valid: false` and refuse the whole download (no silent skipping); new
+  snapshots only include available lanes. Repeating a withdrawal never
+  overwrites the original reason. Other lanes keep working normally.
 
 ## Running (Docker Compose, two instances on a shared volume)
 
@@ -51,6 +59,13 @@ python scripts/make_demo_fastq.py /tmp/demo          # makes R1/R2.fastq.gz
 curl http://localhost:8001/lanes/demoLane             # counts
 curl -OJ http://localhost:8001/lanes/demoLane/samples/sampleA/r1
 curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
+
+# Withdraw the lane (reason is mandatory and recorded with the publish row):
+curl -X POST http://localhost:8001/lanes/demoLane/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"contaminated reads found in QC review"}'
+# Afterwards: lane detail/listing stay readable for traceability, but all new
+# sample/quarantine downloads return 409 on both instances.
 ```
 
 ## API surface
@@ -60,13 +75,14 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
 | POST | `/jobs` | Submit a lane (multipart: `lane`, `barcodes` JSON, `r1`, `r2`) |
 | GET | `/jobs`, `/jobs/{id}` | Task status (`queued`/`processing`/`published`/`failed`) |
 | POST | `/jobs/{id}/retry` | Requeue a failed task |
-| GET | `/lanes`, `/lanes/{lane}` | Published lanes and per-bucket counts |
-| GET | `/lanes/{lane}/samples/{sample_id}/{r1\|r2}` | Download a sample mate |
-| GET | `/lanes/{lane}/quarantine/{r1\|r2}` | Download a quarantine mate |
-| POST | `/snapshots` | Freeze the current published lane list |
-| GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots |
-| GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download |
-| GET | `/snapshots/{id}/quarantine/{mate}` | Snapshot-scoped quarantine download |
+| GET | `/lanes`, `/lanes/{lane}` | Published lanes and per-bucket counts (withdrawn state included) |
+| POST | `/lanes/{lane}/withdraw` | Withdraw a published lane with a mandatory reason (idempotent) |
+| GET | `/lanes/{lane}/samples/{sample_id}/{r1\|r2}` | Download a sample mate (409 after withdrawal) |
+| GET | `/lanes/{lane}/quarantine/{r1\|r2}` | Download a quarantine mate (409 after withdrawal) |
+| POST | `/snapshots` | Freeze the current *available* (non-withdrawn) published lanes |
+| GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots (`valid`, `withdrawn_lanes`, `withdrawals`) |
+| GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download (409 if the snapshot is invalid) |
+| GET | `/snapshots/{id}/quarantine/{mate}` | Snapshot-scoped quarantine download (409 if the snapshot is invalid) |
 | GET | `/health` | Liveness, instance id, current job, queue depth |
 
 ## Concurrency and crash safety
@@ -84,6 +100,30 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
   then insert metadata in one DB transaction. Inputs are deleted only after
   the commit, so a crash at any point leaves no half-visible lane.
 
+## Withdrawal semantics
+
+* Withdrawal only inserts a row in `lane_withdrawals` inside a
+  `BEGIN IMMEDIATE` transaction. Nothing published is deleted or moved: the
+  paired FASTQ files, `lane_publishes` row and `lane_counts` rows all remain
+  for traceability, and `/lanes` / `/lanes/{lane}` still answer.
+* Both withdrawal and snapshot creation hold the SQLite write lock for their
+  whole transaction, so they are strictly ordered. A snapshot that commits
+  first keeps its manifest (and is later flagged invalid when a lane is
+  withdrawn); a withdrawal that commits first means the snapshot cannot
+  include that lane, even when the two calls race.
+* Downloads check withdrawal status before opening files: requests starting
+  after withdrawal fail with `409` as a whole (sample *and* quarantine, on
+  either instance); a response whose streaming already started keeps its open
+  file handle and finishes completely.
+* Snapshots are never rewritten. Their stored lane list is the original
+  manifest; inspection responses add `valid`, `withdrawn_lanes` and
+  `withdrawals`. Any download through an invalid snapshot is refused in full
+  rather than silently omitting the withdrawn lane.
+* Repeating a withdrawal returns `200` with `already_withdrawn: true` and
+  the unchanged original reason. Withdrawing an unpublished/unknown lane is
+  `404`; an empty reason is `400`/`422`. Withdrawn lanes do not affect other
+  lanes' demultiplexing, queries or downloads.
+
 ## Memory
 
 All I/O is streamed record-by-record (1 MiB network chunks, line-based gzip
@@ -97,7 +137,8 @@ data with RSS growth below 64 MiB.
 app/            FastAPI app, SQLite layer, streaming splitter, worker
 scripts/        demo FASTQ generator, two-instance integration check
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, lane
+                withdrawal and withdrawal/snapshot interleavings)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```
